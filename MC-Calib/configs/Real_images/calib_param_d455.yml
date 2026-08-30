@@ -1,0 +1,38 @@
+######################################## Boards Parameters ###################################################
+number_x_square: 5          # Number of squares in X direction on your printed board
+number_y_square: 5          # Number of squares in Y direction
+resolution_x: 500           # Board resolution (for generation)
+resolution_y: 500
+length_square: 0.037         # Physical square length (e.g., 0.04 m)
+length_marker: 0.03         # Physical marker length (e.g., 0.03 m)
+number_board: 1             # Set to 1 if using a single ChArUco sheet
+boards_index: []
+square_size: 0.037          # Physical square size (must match length_square)
+number_x_square_per_board: []
+number_y_square_per_board: []
+square_size_per_board: []
+
+######################################## Camera Parameters ###################################################
+distortion_model: 0         # 0: Brown/Perspective (standard for RealSense D455)
+distortion_per_camera: []
+number_camera: 2            # 2 RealSense D455 cameras
+refine_corner: 1            # Sub-pixel corner refinement
+min_perc_pts: 0.35          # Min percentage of visible points required per frame
+cam_params_path: "None"     # "None" to solve from scratch, or path to intrinsic initialization
+
+######################################## Images Parameters ###################################################
+root_path: "/home/MC-Calib/data/"  # Path to parent folder containing Cam_001, Cam_002, Cam_003
+cam_prefix: "Cam_"
+keypoints_path: "None"
+
+######################################## Optimization Parameters #############################################
+quaternion_averaging: 1
+ransac_threshold: 10.0
+number_iterations: 1000
+he_approach: 0
+
+######################################## Output Parameters ###################################################
+save_path: "/home/MC-Calib/data/calibration_output"
+save_detection: 1
+save_reprojection: 1
+camera_params_file_name: "realsense_3cam_calibrated.yml"

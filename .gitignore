@@ -1,0 +1,41 @@
+# Python virtual environments
+myenv/
+venv/
+env/
+.venv/
+ENV/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Build & CMake artifacts
+build/
+bin/
+lib/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeLists.txt.user
+compile_commands.json
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Heavy data / point clouds / recorded frames (uncomment if you want to exclude these)
+# *.ply
+# *.bag
+# cam*_color.png
+# cam*_depth.png
+
+# IDE and OS metadata
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

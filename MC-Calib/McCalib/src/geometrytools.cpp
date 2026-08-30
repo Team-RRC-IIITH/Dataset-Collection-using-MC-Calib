@@ -1,0 +1,953 @@
+#include "opencv2/core/core.hpp"
+#include <algorithm>
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <random>
+#include <stdio.h>
+
+#include "geometrytools.hpp"
+#include "logger.h"
+
+namespace McCalib {
+
+/**
+ * @brief Convert rotation matrix and translation vector into a 4x4 transform.
+ */
+cv::Mat RT2Proj(const cv::Mat &R, const cv::Mat &T) {
+  cv::Mat Proj = cv::Mat::eye(4, 4, CV_64F);
+  R.copyTo(Proj(cv::Range(0, 3), cv::Range(0, 3)));
+  T.copyTo(Proj(cv::Range(0, 3), cv::Range(3, 4)));
+  return Proj;
+}
+
+/**
+ * @brief Convert Rodrigues rotation and translation into a 4x4 transform.
+ */
+cv::Mat RVecT2Proj(const cv::Mat &RVec, const cv::Mat &T) {
+  cv::Mat R;
+  cv::Rodrigues(RVec, R);
+  cv::Mat Proj = cv::Mat::eye(4, 4, CV_64F);
+  R.copyTo(Proj(cv::Range(0, 3), cv::Range(0, 3)));
+  T.copyTo(Proj(cv::Range(0, 3), cv::Range(3, 4)));
+  return Proj;
+}
+
+/**
+ * @brief Build a camera projection transform using intrinsics and extrinsics.
+ */
+cv::Mat RVecT2ProjInt(const cv::Mat &RVec, const cv::Mat &T, const cv::Mat &K) {
+  cv::Mat R;
+  cv::Rodrigues(RVec, R);
+  cv::Mat Proj = cv::Mat::eye(4, 4, CV_64F);
+  cv::Mat KR = K * R;
+  cv::Mat KT = K * T;
+  KR.copyTo(Proj(cv::Range(0, 3), cv::Range(0, 3)));
+  KT.copyTo(Proj(cv::Range(0, 3), cv::Range(3, 4)));
+  return Proj;
+}
+
+/**
+ * @brief Convert a homogeneous transform into Rodrigues and translation form.
+ */
+void Proj2RT(const cv::Mat &Proj, cv::Mat &R,
+             cv::Mat &T) // Rodrigues and translation vector
+{
+  cv::Rodrigues(Proj(cv::Range(0, 3), cv::Range(0, 3)), R);
+  T = Proj(cv::Range(0, 3), cv::Range(3, 4));
+}
+
+/**
+ * @brief Convert a 6-value pose vector into a 4x4 transform.
+ */
+cv::Mat vectorProj(const std::vector<float> &ProjV) // R Rodrigues | T vector
+{
+  cv::Mat RV(1, 3, CV_64F);
+  cv::Mat TV(3, 1, CV_64F);
+  RV.at<double>(0) = (double)ProjV[0];
+  RV.at<double>(1) = (double)ProjV[1];
+  RV.at<double>(2) = (double)ProjV[2];
+  cv::Mat R;
+  cv::Rodrigues(RV, R);
+  TV.at<double>(0) = (double)ProjV[3];
+  TV.at<double>(1) = (double)ProjV[4];
+  TV.at<double>(2) = (double)ProjV[5];
+  cv::Mat Proj = cv::Mat::eye(4, 4, CV_64F);
+  R.copyTo(Proj(cv::Range(0, 3), cv::Range(0, 3)));
+  TV.copyTo(Proj(cv::Range(0, 3), cv::Range(3, 4)));
+  return Proj;
+}
+
+/**
+ * @brief Convert a 4x4 transform into a 6-value pose vector.
+ */
+std::array<float, 6> ProjToVec(const cv::Mat &Proj) {
+  cv::Mat R(1, 3, CV_64F);
+  cv::Mat T(3, 1, CV_64F);
+  cv::Rodrigues(Proj(cv::Range(0, 3), cv::Range(0, 3)), R);
+  T = Proj(cv::Range(0, 3), cv::Range(3, 4));
+  std::array<float, 6> output = {
+      (float)R.at<double>(0), (float)R.at<double>(1), (float)R.at<double>(2),
+      (float)T.at<double>(0), (float)T.at<double>(1), (float)T.at<double>(2)};
+  return output;
+}
+
+/**
+ * @brief Invert a pose given as Rodrigues rotation and translation.
+ */
+void invertRvecT(const cv::Mat &Rvec, const cv::Mat &T, cv::Mat &iR,
+                 cv::Mat &iT) {
+  cv::Mat Proj = RVecT2Proj(Rvec, T);
+  Proj = Proj.inv();
+  Proj2RT(Proj, iR, iT);
+}
+
+/**
+ * @brief Invert a pose in place.
+ */
+void invertRvecT(cv::Mat &Rvec, cv::Mat &T) {
+  cv::Mat Proj = RVecT2Proj(Rvec, T);
+  Proj = Proj.inv();
+  Proj2RT(Proj, Rvec, T);
+}
+
+/**
+ * @brief Triangulate one 3D point from multiple calibrated observations.
+ *
+ * Uses a linear SVD-based solver over all provided views.
+ */
+cv::Point3f
+triangulateNViewLinearEigen(const std::vector<cv::Point2f> &Pts2D,
+                            const std::vector<cv::Mat> &RotationVec,
+                            const std::vector<cv::Mat> &TranslationVec,
+                            const cv::Mat &Intrinsic) {
+  cv::Mat A; // Projection matrix
+  for (std::size_t i = 0; i < RotationVec.size(); i++) {
+    cv::Mat cam_temp =
+        RVecT2ProjInt(RotationVec[i], TranslationVec[i], Intrinsic);
+    float px = Pts2D[i].x;
+    float py = Pts2D[i].y;
+    cv::Mat M1 = cam_temp.row(0);
+    cv::Mat M2 = cam_temp.row(1);
+    cv::Mat M3 = cam_temp.row(2);
+    A.push_back(px * M3 - M1);
+    A.push_back(py * M3 - M2);
+  }
+  cv::Mat S, U, VT;
+  SVDecomp(A, S, U, VT);
+  cv::Mat PtsTri = VT.row(3);
+  PtsTri.convertTo(PtsTri, CV_32F);
+  cv::Point3f PtsTrip;
+  PtsTrip.x = PtsTri.at<float>(0) / PtsTri.at<float>(3);
+  PtsTrip.y = PtsTri.at<float>(1) / PtsTri.at<float>(3);
+  PtsTrip.z = PtsTri.at<float>(2) / PtsTri.at<float>(3);
+  return PtsTrip;
+}
+
+/**
+ * @brief Fit a 2D line and return normalized residual statistics.
+ *
+ * @param pts Input 2D points.
+ * @param a Output line coefficient.
+ * @param b Output line coefficient.
+ * @param c Output line coefficient.
+ * @param res Output mean absolute algebraic residual.
+ */
+void calcLinePara(const std::vector<cv::Point2f> &pts, double &a, double &b,
+                  double &c, double &res) {
+  res = 0;
+  cv::Vec4f line;
+  std::vector<cv::Point2f> ptsF;
+  ptsF.reserve(pts.size());
+  for (const auto &pt : pts)
+    ptsF.emplace_back(pt);
+
+  cv::fitLine(ptsF, line, cv::DIST_L2, 0, 1e-2, 1e-2);
+  a = line[1];
+  b = -line[0];
+  c = line[0] * line[3] - line[1] * line[2];
+
+  for (const auto &pt : pts) {
+    double resid_ = fabs(pt.x * a + pt.y * b + c);
+    res += resid_;
+  }
+  res /= pts.size();
+}
+
+/**
+ * @brief Robustly triangulate a 3D point with RANSAC.
+ *
+ * Samples two views at a time, triangulates a candidate point, and keeps the
+ * solution with the largest reprojection-consistent inlier set.
+ */
+void ransacTriangulation(const std::vector<cv::Point2f> &point2d,
+                         const std::vector<cv::Mat> &rotation_vec,
+                         const std::vector<cv::Mat> &translation_vec,
+                         const cv::Mat &intrinsic,
+                         const cv::Mat &distortion_vector, const double thresh,
+                         const double p, const int it,
+                         cv::Point3f &best_points3d) {
+  // Init parameters
+  int N = it;
+  int trialcount = 0;
+  cv::Mat InliersR;
+  int countit = 0;
+  unsigned int BestInNb = 0;
+  double myepsilon = 0.00001; // small value for numerical problem
+
+  // Vector of index to shuffle
+  std::srand(unsigned(std::time(0)));
+  std::vector<int> myvector(point2d.size());
+  std::iota(myvector.begin(), myvector.end(), 0);
+
+  // Ransac iterations
+  while (N > trialcount && countit < it) {
+    // pick 2 points
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(myvector.begin(), myvector.end(), g);
+    std::array<int, 4> idx = {myvector[0], myvector[1], myvector[2],
+                              myvector[3]};
+
+    // Select the corresponding sample of 2D pts and corresponding rot and trans
+    std::vector<cv::Point2f> image2Pts = {point2d[idx[0]], point2d[idx[1]]};
+    std::vector<cv::Mat> Rot2Pts = {rotation_vec[idx[0]], rotation_vec[idx[1]]};
+    std::vector<cv::Mat> Trans2Pts = {translation_vec[idx[0]],
+                                      translation_vec[idx[1]]};
+
+    // Triangulate with these 2 pts
+    cv::Point3f PtsTrip =
+        triangulateNViewLinearEigen(image2Pts, Rot2Pts, Trans2Pts, intrinsic);
+
+    // compute inliers
+    cv::Mat Index;
+    unsigned int num_inliers = 0u;
+    for (std::size_t k = 0; k < rotation_vec.size(); k++) {
+      // Reproject points
+      std::vector<cv::Point2f> reprojected_pts;
+      std::vector<cv::Point3f> point3d_tmp = {PtsTrip};
+      projectPoints(point3d_tmp, rotation_vec[k], translation_vec[k], intrinsic,
+                    distortion_vector, reprojected_pts);
+      if (std::sqrt(std::pow((point2d[k].x - reprojected_pts[0].x), 2) +
+                    std::pow((point2d[k].y - reprojected_pts[0].y), 2)) <
+          thresh) {
+        Index.push_back(static_cast<int>(k));
+        num_inliers++;
+      }
+    }
+    trialcount++;
+
+    // keep the best one
+    if (num_inliers > BestInNb) {
+      Index.copyTo(InliersR);
+      BestInNb = num_inliers;
+      best_points3d = PtsTrip;
+
+      // with probability p, a data set with no outliers.
+      double totalPts = point2d.size();
+      double fracinliers = BestInNb / totalPts;
+      double pNoOutliers = 1 - pow(fracinliers, 3);
+      if (pNoOutliers == 0)
+        pNoOutliers = myepsilon; // Avoid division by Inf
+      if (pNoOutliers > (1 - myepsilon))
+        pNoOutliers = 1 - myepsilon; // Avoid division by zero
+      double tempest = log(1 - p) / log(pNoOutliers);
+      N = int(round(tempest));
+      trialcount = 0;
+    }
+    countit++;
+  }
+}
+
+/**
+ * @brief Estimate camera pose from 3D-2D correspondences with RANSAC P3P.
+ *
+ * @return Inlier index matrix for the best pose.
+ */
+cv::Mat ransacP3P(const std::vector<cv::Point3f> &scenePoints,
+                  const std::vector<cv::Point2f> &imagePoints,
+                  const cv::Mat Intrinsic, const cv::Mat Disto, cv::Mat &BestR,
+                  cv::Mat &BestT, const float thresh, const int it,
+                  const double p, const bool refine) {
+
+  // Init parameters
+  int N = it;
+  int trialcount = 0;
+  cv::Mat InliersR;
+  int countit = 0;
+  int BestInNb = 0;
+  double myepsilon = 0.00001; // small value for numerical problem
+  cv::Mat Rot(1, 3, CV_64F);
+  cv::Mat Trans(1, 3, CV_64F);
+
+  // Vector of index to shuffle
+  std::srand(unsigned(std::time(0)));
+  std::vector<int> myvector(imagePoints.size());
+  std::iota(myvector.begin(), myvector.end(), 0);
+
+  // Ransac iterations
+  while (N > trialcount && countit < it) {
+    // pick 4 points
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(myvector.begin(), myvector.end(), g);
+    std::array<int, 4> idx = {myvector[0], myvector[1], myvector[2],
+                              myvector[3]};
+
+    // Select the corresponding sample
+    std::vector<cv::Point3f> scenePoints3Pts = {
+        scenePoints[idx[0]], scenePoints[idx[1]], scenePoints[idx[2]],
+        scenePoints[idx[3]]};
+    std::vector<cv::Point2f> imagePoints3Pts = {
+        imagePoints[idx[0]], imagePoints[idx[1]], imagePoints[idx[2]],
+        imagePoints[idx[3]]};
+
+    // Apply P3P (fourth point for disambiguation)
+    cv::solvePnP(scenePoints3Pts, imagePoints3Pts, Intrinsic, Disto, Rot, Trans,
+                 false, 2); // CV_P3P = 2
+
+    // Reproject points
+    std::vector<cv::Point2f> reprojected_pts;
+    projectPoints(scenePoints, Rot, Trans, Intrinsic, Disto, reprojected_pts);
+
+    // compute inliers
+    cv::Mat Index;
+    int NbInliers = 0;
+    for (int k = 0; k < (int)scenePoints.size(); k++) {
+      if (std::sqrt(std::pow(imagePoints[k].x - reprojected_pts[k].x, 2) +
+                    std::pow(imagePoints[k].y - reprojected_pts[k].y, 2)) <
+          thresh) {
+        Index.push_back(k);
+        NbInliers++;
+      }
+    }
+    trialcount++;
+
+    // keep the best one
+    if (NbInliers > BestInNb) {
+      Index.copyTo(InliersR);
+      BestInNb = NbInliers;
+      Trans.copyTo(BestT);
+      Rot.copyTo(BestR);
+
+      // with probability p, a data set with no outliers.
+      double totalPts = scenePoints.size();
+      double fracinliers = BestInNb / totalPts;
+      double pNoOutliers = 1 - pow(fracinliers, 3);
+      if (pNoOutliers == 0)
+        pNoOutliers = myepsilon; // Avoid division by Inf
+      if (pNoOutliers > (1 - myepsilon))
+        pNoOutliers = 1 - myepsilon; // Avoid division by zero
+      double tempest = log(1 - p) / log(pNoOutliers);
+      N = int(round(tempest));
+      trialcount = 0;
+    }
+    countit++;
+  }
+
+  if (refine == true && BestInNb >= 4) {
+    std::vector<cv::Point3f> scenePointsInliers(BestInNb);
+    std::vector<cv::Point2f> imagePointsInliers(BestInNb);
+
+    for (int j = 0; j < BestInNb; j++) {
+      imagePointsInliers[j] = imagePoints[InliersR.at<int>(j)];
+      scenePointsInliers[j] = scenePoints[InliersR.at<int>(j)];
+    }
+    cv::solvePnP(scenePointsInliers, imagePointsInliers, Intrinsic, Disto,
+                 BestR, BestT, true, 0); // CV_ITERATIVE = 0 non linear
+  }
+  return InliersR;
+}
+
+/**
+ * @brief Apply a rigid transform to a set of 3D points.
+ *
+ * @param pts3D Input 3D points.
+ * @param Rot Rodrigues rotation vector.
+ * @param Trans Translation vector.
+ * @return Transformed 3D points.
+ */
+std::vector<cv::Point3f> transform3DPts(const std::vector<cv::Point3f> &pts3D,
+                                        const cv::Mat &Rot,
+                                        const cv::Mat &Trans) {
+  cv::Mat RotM;
+  cv::Rodrigues(Rot, RotM);
+  double r11 = RotM.at<double>(0, 0);
+  double r12 = RotM.at<double>(0, 1);
+  double r13 = RotM.at<double>(0, 2);
+  double r21 = RotM.at<double>(1, 0);
+  double r22 = RotM.at<double>(1, 1);
+  double r23 = RotM.at<double>(1, 2);
+  double r31 = RotM.at<double>(2, 0);
+  double r32 = RotM.at<double>(2, 1);
+  double r33 = RotM.at<double>(2, 2);
+  double tx = Trans.at<double>(0);
+  double ty = Trans.at<double>(1);
+  double tz = Trans.at<double>(2);
+
+  std::vector<cv::Point3f> pts3D_transformed;
+  for (const cv::Point3f &pt3D : pts3D) {
+    float x = tx + r11 * pt3D.x + r12 * pt3D.y + r13 * pt3D.z;
+    float y = ty + r21 * pt3D.x + r22 * pt3D.y + r23 * pt3D.z;
+    float z = tz + r31 * pt3D.x + r32 * pt3D.y + r33 * pt3D.z;
+    pts3D_transformed.emplace_back(x, y, z);
+  }
+
+  return pts3D_transformed;
+}
+
+/**
+ * @brief Estimate the rigid transform between two camera-group trajectories.
+ *
+ * Uses OpenCV hand-eye calibration on paired absolute poses.
+ *
+ * @param pose_abs_1 Absolute poses from the first trajectory.
+ * @param pose_abs_2 Absolute poses from the second trajectory.
+ * @return 4x4 transform from group 1 to group 2.
+ */
+cv::Mat handeyeCalibration(const std::vector<cv::Mat> &pose_abs_1,
+                           const std::vector<cv::Mat> &pose_abs_2) {
+
+  // Prepare the poses for handeye calibration
+  const size_t num_poses = pose_abs_1.size();
+  std::vector<cv::Mat> r_cam_group_1(num_poses), t_cam_group_1(num_poses),
+      r_cam_group_2(num_poses), t_cam_group_2(num_poses);
+  for (size_t i = 0; i < num_poses; i++) {
+    // get the poses
+    cv::Mat pose_cam_group_1 = pose_abs_1[i].inv();
+    cv::Mat pose_cam_group_2 = pose_abs_2[i];
+
+    // save in datastruct
+    cv::Mat r_1, r_2, t_1, t_2;
+    Proj2RT(pose_cam_group_1, r_1, t_1);
+    Proj2RT(pose_cam_group_2, r_2, t_2);
+    cv::Mat r_1_mat, r_2_mat;
+    Rodrigues(r_1, r_1_mat);
+    Rodrigues(r_2, r_2_mat);
+    r_cam_group_1[i] = r_1_mat;
+    t_cam_group_1[i] = t_1;
+    r_cam_group_2[i] = r_2_mat;
+    t_cam_group_2[i] = t_2;
+  }
+
+  // Hand-eye calibration
+  cv::Mat r_g1_g2, t_g1_g2;
+  cv::calibrateHandEye(r_cam_group_1, t_cam_group_1, r_cam_group_2,
+                       t_cam_group_2, r_g1_g2, t_g1_g2,
+                       cv::CALIB_HAND_EYE_HORAUD);
+  cv::Mat pose_g1_g2 = RT2Proj(r_g1_g2, t_g1_g2);
+
+  return pose_g1_g2;
+}
+
+/**
+ * @brief Build clustering features from paired translation vectors.
+ *
+ * @param pose_abs_1 Poses of the first trajectory.
+ * @param pose_abs_2 Poses of the second trajectory.
+ * @return Matrix with one row per pose pair and concatenated translations.
+ */
+cv::Mat getTranslationsForClustering(const std::vector<cv::Mat> &pose_abs_1,
+                                     const std::vector<cv::Mat> &pose_abs_2) {
+  cv::Mat position_1_2;
+  const std::size_t num_poses = std::min(pose_abs_1.size(), pose_abs_2.size());
+  for (std::size_t i = 0u; i < num_poses; i++) {
+    cv::Mat trans_1, trans_2, rot_1, rot_2;
+    Proj2RT(pose_abs_1[i], rot_1, trans_1);
+    Proj2RT(pose_abs_2[i], rot_2, trans_2);
+    cv::Mat concat_trans_1_2;
+    cv::hconcat(trans_1.t(), trans_2.t(), concat_trans_1_2);
+    position_1_2.push_back(concat_trans_1_2);
+  }
+  position_1_2.convertTo(position_1_2, CV_32F);
+  return position_1_2;
+}
+
+/**
+ * @brief Cluster paired translations to diversify hand-eye samples.
+ *
+ * @param position_1_2 Concatenated translation rows.
+ * @param num_clusters Number of clusters.
+ * @return Cluster label per input row.
+ */
+cv::Mat clusterTranslations(const cv::Mat &position_1_2,
+                            const unsigned int num_clusters) {
+  const unsigned int nb_kmean_iterations = 5;
+  cv::Mat labels;
+  cv::Mat centers;
+  std::ignore =
+      cv::kmeans(position_1_2, num_clusters, labels,
+                 cv::TermCriteria(
+                     cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 10, 0.01),
+                 nb_kmean_iterations, cv::KMEANS_PP_CENTERS, centers);
+  labels.convertTo(labels, CV_32S);
+  return labels;
+}
+
+/**
+ * @brief Randomly select a subset of cluster ids.
+ *
+ * @param num_clusters Total number of clusters.
+ * @param nb_clust_pick Number of clusters to select.
+ * @return Selected cluster ids.
+ */
+std::vector<unsigned int> selectClusters(const unsigned int num_clusters,
+                                         const unsigned int nb_clust_pick) {
+  // pick from n clusters randomly
+  std::vector<unsigned int> shuffled_ind(num_clusters);
+  std::iota(shuffled_ind.begin(), shuffled_ind.end(), 0);
+  assert(shuffled_ind.size() == num_clusters);
+
+  std::random_device rd;
+  std::mt19937 g(rd());
+  std::shuffle(shuffled_ind.begin(), shuffled_ind.end(), g);
+  std::vector<unsigned int> cluster_select;
+  cluster_select.reserve(nb_clust_pick);
+  for (unsigned int k = 0; k < nb_clust_pick; ++k) {
+    cluster_select.push_back(shuffled_ind[k]);
+  }
+
+  assert(cluster_select.size() == nb_clust_pick);
+  return cluster_select;
+}
+
+/**
+ * @brief Pick one pose index from each selected cluster.
+ *
+ * @param clusters_lables Cluster label per pose.
+ * @param selected_cluster_idxs Cluster ids selected for sampling.
+ * @return Pose indices chosen for the current bootstrap iteration.
+ */
+std::vector<unsigned int>
+selectPoses(const cv::Mat &clusters_lables,
+            const std::vector<unsigned int> &selected_cluster_idxs) {
+  // Select one pair of pose (indexes) from each cluster
+  std::vector<unsigned int> selected_poses_idxs;
+  selected_poses_idxs.reserve(selected_cluster_idxs.size());
+  for (const unsigned int cluster_idx : selected_cluster_idxs) {
+    std::vector<unsigned int> pose_idxs;
+    for (int pose_idx = 0u; pose_idx < clusters_lables.size[0]; pose_idx++) {
+      if (clusters_lables.at<unsigned int>(pose_idx) == cluster_idx) {
+        pose_idxs.push_back(pose_idx);
+      }
+    }
+    // randomly select an index in the occurrences of the cluster
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, pose_idxs.size() - 1);
+    unsigned int random_idx = dis(gen);
+    selected_poses_idxs.push_back(pose_idxs[random_idx]);
+  }
+
+  assert(selected_poses_idxs.size() == selected_cluster_idxs.size());
+  return selected_poses_idxs;
+}
+
+/**
+ * @brief Convert selected absolute poses into hand-eye calibration inputs.
+ *
+ * @param pose_abs_1 Poses of trajectory 1.
+ * @param pose_abs_2 Poses of trajectory 2.
+ * @param selected_poses_idxs Selected pose indices.
+ * @param r_cam_group_1 Output rotation matrices for trajectory 1.
+ * @param t_cam_group_1 Output translations for trajectory 1.
+ * @param r_cam_group_2 Output rotation matrices for trajectory 2.
+ * @param t_cam_group_2 Output translations for trajectory 2.
+ */
+void preparePosesForHandEyeCalibration(
+    const std::vector<cv::Mat> &pose_abs_1,
+    const std::vector<cv::Mat> &pose_abs_2,
+    const std::vector<unsigned int> &selected_poses_idxs,
+    std::vector<cv::Mat> &r_cam_group_1, std::vector<cv::Mat> &t_cam_group_1,
+    std::vector<cv::Mat> &r_cam_group_2, std::vector<cv::Mat> &t_cam_group_2) {
+  const std::size_t nb_clust_pick = selected_poses_idxs.size();
+  r_cam_group_1.reserve(nb_clust_pick);
+  t_cam_group_1.reserve(nb_clust_pick);
+  r_cam_group_2.reserve(nb_clust_pick);
+  t_cam_group_2.reserve(nb_clust_pick);
+  for (const unsigned int pose_ind_i : selected_poses_idxs) {
+    // get the poses
+    const cv::Mat pose_cam_group_1 = pose_abs_1[pose_ind_i].inv();
+    const cv::Mat pose_cam_group_2 = pose_abs_2[pose_ind_i];
+
+    // save in datastruct
+    cv::Mat r_1, r_2, t_1, t_2;
+    Proj2RT(pose_cam_group_1, r_1, t_1);
+    Proj2RT(pose_cam_group_2, r_2, t_2);
+    cv::Mat r_1_mat, r_2_mat;
+    cv::Rodrigues(r_1, r_1_mat);
+    cv::Rodrigues(r_2, r_2_mat);
+    r_cam_group_1.push_back(r_1_mat);
+    t_cam_group_1.push_back(t_1);
+    r_cam_group_2.push_back(r_2_mat);
+    t_cam_group_2.push_back(t_2);
+  }
+}
+
+/**
+ * @brief Sample clustered pose pairs and prepare hand-eye calibration inputs.
+ *
+ * @param pose_abs_1 Poses of trajectory 1.
+ * @param pose_abs_2 Poses of trajectory 2.
+ * @param clusters_labels Cluster labels for all pose pairs.
+ * @param num_clusters Number of available clusters.
+ * @param nb_clust_pick Number of clusters to sample.
+ * @param r_cam_group_1 Output rotation matrices for trajectory 1.
+ * @param t_cam_group_1 Output translations for trajectory 1.
+ * @param r_cam_group_2 Output rotation matrices for trajectory 2.
+ * @param t_cam_group_2 Output translations for trajectory 2.
+ * @param selected_poses_idxs Output selected pose indices.
+ */
+void getPosesForHandeyeCalibration(
+    const std::vector<cv::Mat> &pose_abs_1,
+    const std::vector<cv::Mat> &pose_abs_2, const cv::Mat &clusters_labels,
+    const unsigned int num_clusters, const unsigned int nb_clust_pick,
+    std::vector<cv::Mat> &r_cam_group_1, std::vector<cv::Mat> &t_cam_group_1,
+    std::vector<cv::Mat> &r_cam_group_2, std::vector<cv::Mat> &t_cam_group_2,
+    std::vector<unsigned int> &selected_poses_idxs) {
+  const std::vector<unsigned int> selected_cluster_idxs =
+      selectClusters(num_clusters, nb_clust_pick);
+
+  selected_poses_idxs = selectPoses(clusters_labels, selected_cluster_idxs);
+
+  preparePosesForHandEyeCalibration(pose_abs_1, pose_abs_2, selected_poses_idxs,
+                                    r_cam_group_1, t_cam_group_1, r_cam_group_2,
+                                    t_cam_group_2);
+}
+
+/**
+ * @brief Evaluate rotational consistency of a hand-eye solution.
+ *
+ * @param pose_abs_1 Poses of trajectory 1.
+ * @param pose_abs_2 Poses of trajectory 2.
+ * @param selected_poses_idxs Pose indices used in the trial.
+ * @param pose_g1_g2 Candidate transform from trajectory 1 to trajectory 2.
+ * @return Maximum pairwise rotational inconsistency in degrees.
+ */
+double checkSetConsistency(const std::vector<cv::Mat> &pose_abs_1,
+                           const std::vector<cv::Mat> &pose_abs_2,
+                           const std::vector<unsigned int> &selected_poses_idxs,
+                           const cv::Mat &pose_g1_g2) {
+  double max_rotational_error = 0.;
+  for (unsigned int i = 0; i < selected_poses_idxs.size(); i++) {
+    cv::Mat pose_cam_group_1_1 = pose_abs_1[selected_poses_idxs[i]];
+    cv::Mat pose_cam_group_2_1 = pose_abs_2[selected_poses_idxs[i]];
+    for (unsigned int j = 0; j < selected_poses_idxs.size(); j++) {
+      if (i != j) {
+        cv::Mat pose_cam_group_1_2 = pose_abs_1[selected_poses_idxs[i]];
+        cv::Mat pose_cam_group_2_2 = pose_abs_2[selected_poses_idxs[i]];
+        cv::Mat PP1 = pose_cam_group_1_2.inv() * pose_cam_group_1_1;
+        cv::Mat PP2 = pose_cam_group_2_1.inv() * pose_cam_group_2_2;
+        cv::Mat ErrMat = PP2.inv() * pose_g1_g2 * PP1 * pose_g1_g2;
+        cv::Mat ErrRot, ErrTrans;
+        Proj2RT(ErrMat, ErrRot, ErrTrans);
+        cv::Mat ErrRotMat;
+        cv::Rodrigues(ErrRot, ErrRotMat);
+        double traceRot =
+            cv::trace(ErrRotMat)[0] - std::numeric_limits<double>::epsilon();
+        double err_degree = std::acos(0.5 * (traceRot - 1.0)) * 180.0 / M_PI;
+        max_rotational_error = std::max(max_rotational_error, err_degree);
+      }
+    }
+  }
+  return max_rotational_error;
+}
+
+/**
+ * @brief Estimate a hand-eye transform with clustered bootstrap sampling.
+ *
+ * Only a subset of diverse pose pairs is used per iteration. Valid solutions
+ * are filtered by a consistency check and aggregated into a final estimate.
+ *
+ * @param nb_cluster Number of translation clusters.
+ * @param nb_it Number of bootstrap iterations.
+ * @param pose_abs_1 Absolute poses of the first trajectory.
+ * @param pose_abs_2 Absolute poses of the second trajectory.
+ * @return Robust 4x4 transform estimate between the two trajectories.
+ */
+cv::Mat handeyeBootstraptTranslationCalibration(
+    const unsigned int nb_cluster, const unsigned int nb_it,
+    const std::vector<cv::Mat> &pose_abs_1,
+    const std::vector<cv::Mat> &pose_abs_2) {
+
+  LOG_INFO << "Run bootstrapt handeye calibration";
+
+  // concat of the translation of pose 1 and 2 for clustering
+  cv::Mat position_1_2 = getTranslationsForClustering(pose_abs_1, pose_abs_2);
+  const unsigned int num_poses = position_1_2.size[0];
+
+  // Cluster the observation to select the most diverse poses
+  const unsigned int num_clusters = std::min(nb_cluster, num_poses);
+  const cv::Mat clusters_labels =
+      clusterTranslations(position_1_2, num_clusters);
+
+  std::vector<double> r1_he, r2_he, r3_he; // structure to save valid rot
+  std::vector<double> t1_he, t2_he, t3_he; // structure to save valid trans
+  const unsigned int nb_clust_pick = 6;
+  unsigned int nb_success = 0;
+  for (unsigned int iter = 0; iter < nb_it; iter++) {
+    std::vector<cv::Mat> r_cam_group_1, t_cam_group_1, r_cam_group_2,
+        t_cam_group_2;
+    std::vector<unsigned int> selected_poses_idxs;
+    getPosesForHandeyeCalibration(pose_abs_1, pose_abs_2, clusters_labels,
+                                  num_clusters, nb_clust_pick, r_cam_group_1,
+                                  t_cam_group_1, r_cam_group_2, t_cam_group_2,
+                                  selected_poses_idxs);
+
+    // Hand-eye calibration
+    cv::Mat r_g1_g2, t_g1_g2;
+    cv::calibrateHandEye(r_cam_group_1, t_cam_group_1, r_cam_group_2,
+                         t_cam_group_2, r_g1_g2, t_g1_g2,
+                         cv::CALIB_HAND_EYE_TSAI);
+    cv::Mat pose_g1_g2 = RT2Proj(r_g1_g2, t_g1_g2);
+
+    double max_rotational_error = checkSetConsistency(
+        pose_abs_1, pose_abs_2, selected_poses_idxs, pose_g1_g2);
+    if (max_rotational_error < 15) {
+      nb_success++;
+      // if it is a sucess then add to our valid pose vector
+      cv::Mat rot_temp, trans_temp;
+      Proj2RT(pose_g1_g2, rot_temp, trans_temp);
+      r1_he.push_back(rot_temp.at<double>(0));
+      r2_he.push_back(rot_temp.at<double>(1));
+      r3_he.push_back(rot_temp.at<double>(2));
+      t1_he.push_back(trans_temp.at<double>(0));
+      t2_he.push_back(trans_temp.at<double>(1));
+      t3_he.push_back(trans_temp.at<double>(2));
+    }
+  }
+
+  // if enough sucess (at least 3) then compute median value
+  if (nb_success > 3) {
+    cv::Mat r_he = getAverageRotation(r1_he, r2_he, r3_he);
+    cv::Mat t_he = cv::Mat::zeros(3, 1, CV_64F);
+    t_he.at<double>(0) = median(t1_he);
+    t_he.at<double>(1) = median(t2_he);
+    t_he.at<double>(2) = median(t3_he);
+    cv::Mat pose_g1_g2 = RVecT2Proj(r_he, t_he);
+    return pose_g1_g2;
+  } else {
+    LOG_INFO << "Run the normal handeye calibration on all the samples";
+    cv::Mat pose_g1_g2 = handeyeCalibration(pose_abs_1, pose_abs_1);
+    return pose_g1_g2;
+  }
+}
+
+/**
+ * @brief Compute the median of a vector.
+ *
+ * Note: this function sorts and therefore modifies the input vector.
+ *
+ * @param v Input vector.
+ * @return Median value.
+ */
+double median(std::vector<double> &v) {
+  const std::size_t n_elements = v.size();
+  if (n_elements == 0)
+    return 0.f;
+  std::sort(v.begin(), v.end());
+  const std::size_t mid = n_elements / 2;
+  return n_elements % 2 == 0 ? (v[mid] + v[mid - 1]) / 2 : v[mid];
+}
+
+/**
+ * @brief Dispatch robust P3P pose estimation for the configured distortion
+ * model.
+ *
+ * @param scene_points Input 3D points.
+ * @param image_points Input 2D image points.
+ * @param intrinsic Camera intrinsic matrix.
+ * @param distortion_vector Distortion coefficients.
+ * @param best_R Output best Rodrigues rotation vector.
+ * @param best_T Output best translation vector.
+ * @param thresh Reprojection threshold in pixels.
+ * @param it Maximum RANSAC iterations.
+ * @param distortion_type Distortion model id: 0 perspective, 1 fisheye.
+ * @param p Target confidence.
+ * @param refine If true, refine best candidate on inliers.
+ * @return Inlier index matrix for the best solution.
+ */
+cv::Mat ransacP3PDistortion(const std::vector<cv::Point3f> &scene_points,
+                            const std::vector<cv::Point2f> &image_points,
+                            const cv::Mat &intrinsic,
+                            const cv::Mat &distortion_vector, cv::Mat &best_R,
+                            cv::Mat &best_T, const float thresh, const int it,
+                            const int distortion_type, const double p,
+                            const bool refine) {
+  cv::Mat Inliers;
+  // P3P for perspective (Brown model)
+  if (distortion_type == 0) {
+    Inliers =
+        ransacP3P(scene_points, image_points, intrinsic, distortion_vector,
+                  best_R, best_T, thresh, it, p, refine);
+  }
+
+  // P3P for fisheye
+  if (distortion_type == 1) {
+    // undistord the point
+    std::vector<cv::Point2f> imagePointsUndis;
+    cv::Mat New_Intrinsic = intrinsic.clone();
+    cv::fisheye::undistortPoints(image_points, imagePointsUndis, intrinsic,
+                                 distortion_vector);
+
+    // multiply by K to go into cam ref (because the OpenCV function is so
+    // broken ...)
+    for (auto &imagePointUndis : imagePointsUndis) {
+      imagePointUndis.x =
+          imagePointUndis.x * float(intrinsic.at<double>(0, 0)) +
+          float(intrinsic.at<double>(0, 2));
+      imagePointUndis.y =
+          imagePointUndis.y * float(intrinsic.at<double>(1, 1)) +
+          float(intrinsic.at<double>(1, 2));
+    }
+    // Run p3p
+    const cv::Mat zero_distortion_vector = cv::Mat::zeros(1, 5, CV_64F);
+    Inliers = ransacP3P(scene_points, imagePointsUndis, New_Intrinsic,
+                        zero_distortion_vector, best_R, best_T, thresh, it, p,
+                        refine);
+  }
+
+  return Inliers;
+}
+
+// Project point for fisheye and perspective ()
+// distortion_type: 0 (perspective), 1 (fisheye)
+void projectPointsWithDistortion(const std::vector<cv::Point3f> &object_pts,
+                                 const cv::Mat &rot, const cv::Mat &trans,
+                                 const cv::Mat &camera_matrix,
+                                 const cv::Mat &distortion_vector,
+                                 const int distortion_type,
+                                 std::vector<cv::Point2f> &repro_pts) {
+  if (distortion_type == 0) // perspective (Brown)
+  {
+    cv::projectPoints(object_pts, rot, trans, camera_matrix, distortion_vector,
+                      repro_pts);
+  }
+  if (distortion_type == 1) // fisheye (Kannala)
+  {
+    cv::fisheye::projectPoints(object_pts, repro_pts, rot, trans, camera_matrix,
+                               distortion_vector, 0.0);
+  }
+}
+
+cv::Mat convertRotationMatrixToQuaternion(const cv::Mat &R) {
+  // code is adapted from
+  // https://gist.github.com/shubh-agrawal/76754b9bfb0f4143819dbd146d15d4c8
+
+  cv::Mat Q(1, 4, CV_64F); // x y z w
+
+  double trace = R.at<double>(0, 0) + R.at<double>(1, 1) + R.at<double>(2, 2);
+
+  if (trace > 0.0) {
+    double s = std::sqrt(trace + 1.0);
+    Q.at<double>(0, 3) = (s * 0.5);
+    s = 0.5 / s;
+    Q.at<double>(0, 0) = ((R.at<double>(2, 1) - R.at<double>(1, 2)) * s);
+    Q.at<double>(0, 1) = ((R.at<double>(0, 2) - R.at<double>(2, 0)) * s);
+    Q.at<double>(0, 2) = ((R.at<double>(1, 0) - R.at<double>(0, 1)) * s);
+  }
+
+  else {
+    int i = R.at<double>(0, 0) < R.at<double>(1, 1)
+                ? (R.at<double>(1, 1) < R.at<double>(2, 2) ? 2 : 1)
+                : (R.at<double>(0, 0) < R.at<double>(2, 2) ? 2 : 0);
+    int j = (i + 1) % 3;
+    int k = (i + 2) % 3;
+
+    double s = std::sqrt(R.at<double>(i, i) - R.at<double>(j, j) -
+                         R.at<double>(k, k) + 1.0);
+    Q.at<double>(0, i) = s * 0.5;
+    s = 0.5 / s;
+
+    Q.at<double>(0, 3) = (R.at<double>(k, j) - R.at<double>(j, k)) * s;
+    Q.at<double>(0, j) = (R.at<double>(j, i) + R.at<double>(i, j)) * s;
+    Q.at<double>(0, k) = (R.at<double>(k, i) + R.at<double>(i, k)) * s;
+  }
+
+  return Q;
+}
+
+cv::Mat convertQuaternionToRotationMatrix(const std::array<double, 4> &q) {
+  // code adapted from
+  // https://automaticaddison.com/how-to-convert-a-quaternion-to-a-rotation-matrix/
+
+  const double q0 = q[3];
+  const double q1 = q[0];
+  const double q2 = q[1];
+  const double q3 = q[2];
+
+  cv::Mat rot_matrix(3, 3, CV_64F);
+  rot_matrix.at<double>(0, 0) = 2 * (q0 * q0 + q1 * q1) - 1;
+  rot_matrix.at<double>(0, 1) = 2 * (q1 * q2 - q0 * q3);
+  rot_matrix.at<double>(0, 2) = 2 * (q1 * q3 + q0 * q2);
+
+  rot_matrix.at<double>(1, 0) = 2 * (q1 * q2 + q0 * q3);
+  rot_matrix.at<double>(1, 1) = 2 * (q0 * q0 + q2 * q2) - 1;
+  rot_matrix.at<double>(1, 2) = 2 * (q2 * q3 - q0 * q1);
+
+  rot_matrix.at<double>(2, 0) = 2 * (q1 * q3 - q0 * q2);
+  rot_matrix.at<double>(2, 1) = 2 * (q2 * q3 + q0 * q1);
+  rot_matrix.at<double>(2, 2) = 2 * (q0 * q0 + q3 * q3) - 1;
+
+  return rot_matrix;
+}
+
+cv::Mat getAverageRotation(std::vector<double> &r1, std::vector<double> &r2,
+                           std::vector<double> &r3,
+                           const bool use_quaternion_averaging) {
+  cv::Mat average_rotation = cv::Mat::zeros(3, 1, CV_64F);
+  if (use_quaternion_averaging) {
+    // The Quaternion Averaging algorithm is described in
+    // https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/20070017872.pdf
+    // implementaion references:
+    //  -
+    //  https://gist.github.com/PeteBlackerThe3rd/f73e9d569e29f23e8bd828d7886636a0
+    //  -
+    //  https://github.com/tolgabirdal/averaging_quaternions/blob/master/avg_quaternion_markley.m
+
+    assert(r1.size() == r2.size() && r2.size() == r3.size());
+
+    std::vector<cv::Mat> quaternions;
+    // convert rotation vector to quaternion through rotation matrix
+    for (unsigned int angle_idx = 0u; angle_idx < r1.size(); ++angle_idx) {
+      std::array<double, 3> angles = {r1[angle_idx], r2[angle_idx],
+                                      r3[angle_idx]};
+      const cv::Mat rot_vec = cv::Mat(1, 3, CV_64F, angles.data());
+      cv::Mat rot_matrix;
+      cv::Rodrigues(rot_vec, rot_matrix);
+      const cv::Mat quaternion = convertRotationMatrixToQuaternion(rot_matrix);
+      quaternions.push_back(quaternion);
+    }
+
+    cv::Mat A = cv::Mat::zeros(4, 4, CV_64F);
+    for (cv::Mat &q : quaternions) {
+      if (q.at<double>(0, 3) < 0) {
+        // handle the antipodal configurations
+        q = -q;
+      }
+      A += q.t() * q;
+    }
+    A /= quaternions.size();
+
+    cv::SVD svd(A, cv::SVD::FULL_UV);
+    cv::Mat U = svd.u;
+    cv::Mat singularValues = svd.w;
+
+    const unsigned int largestEigenValueIndex = 0u;
+    std::array<double, 4> average_quaternion = {
+        svd.u.at<double>(0, largestEigenValueIndex),
+        svd.u.at<double>(1, largestEigenValueIndex),
+        svd.u.at<double>(2, largestEigenValueIndex),
+        svd.u.at<double>(3, largestEigenValueIndex)};
+
+    cv::Mat rot_matrix = convertQuaternionToRotationMatrix(average_quaternion);
+    cv::Rodrigues(rot_matrix, average_rotation);
+  } else {
+    average_rotation.at<double>(0) = median(r1);
+    average_rotation.at<double>(1) = median(r2);
+    average_rotation.at<double>(2) = median(r3);
+  }
+
+  return average_rotation;
+}
+
+} // namespace McCalib
